@@ -1,0 +1,1504 @@
+from google.colab import files
+print("Select these 4 files: config.py, train_export.py, verify_consistency.py, drift_eval.py")
+uploaded = files.upload()
+print("\nUploaded:", list(uploaded.keys()))
+
+
+import os
+print("Files here:", os.listdir('.'))
+
+
+
+import os
+print("PY FILES:", [f for f in os.listdir('.') if f.endswith('.py')])
+print("\n--- first 15 lines of train_export.py ---")
+with open('train_export.py') as f:
+    for i, line in enumerate(f):
+        if i >= 15: break
+        print(line.rstrip())
+
+
+
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    log_loss,
+    confusion_matrix,
+    classification_report,
+    roc_auc_score
+)
+
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Complete End-to-End TinyML Pipeline for Drift-Compensated Gas Sensor Classification
+===============================================================================
+Matches paper pipeline:
+1) Multi-batch fusion (Batch ID preserved) - AUTO-DOWNLOADS UCI DATASET IF MISSING
+2) Missing-value imputation from non-drifted batches (0-3)
+3) Outlier detection (>4 sigma from batch medians) + temporal interpolation
+4) Correlation-driven feature selection (130 -> 24 sensors)
+5) Train-only min/max quantization to uint8 (paper Eq.)
+6) Constrained DT training in quantized domain
+7) C export with contiguous leaves (node_class[NUM_LEAVES])
+8) Optional engineered features to match embedded: Temp_q, RH_q, drift_rate, age (28 features)
+Author: Bakhita A. Salman, Ph.D.
+"""
+
+import os                                  # Filesystem path/utility helpers (kept for general use).
+import re                                  # Regular expressions, used to parse "index:value" sensor lines.
+from pathlib import Path                   # Object-oriented filesystem paths (cleaner than os.path).
+import numpy as np                         # Numerical arrays and math used throughout the pipeline.
+import pandas as pd                        # Tabular data handling (the batch DataFrames).
+import requests                            # HTTP client used to auto-download the UCI dataset zip.
+import zipfile                             # Reads/extracts the downloaded dataset archive.
+from io import BytesIO                     # Wraps the downloaded bytes so zipfile can read them in memory.
+
+from sklearn.tree import DecisionTreeClassifier   # The decision-tree model that gets deployed to the MCU.
+from sklearn.model_selection import train_test_split  # Stratified train/val/test splitting.
+from sklearn.impute import SimpleImputer          # Mean-imputation of missing sensor values.
+
+# =============================================================================
+# 1) MULTI-BATCH DATA FUSION WITH AUTO-DOWNLOAD
+# =============================================================================
+
+# Precompiled regex matching one "index:value" token, e.g. "12:-3.45e-2".
+# Group 1 = sensor index (digits); Group 2 = floating-point value (optional sign/exponent).
+_IDXVAL_RE = re.compile(r'(\d+):([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)')
+
+def download_uci_gas_drift_if_missing(dataset_root="UCI_Gas_Sensor_Drift_Dataset"):
+    """
+    Automatically downloads the UCI Gas Sensor Array Drift Dataset (~9.5MB)
+    if batch files are missing. Extracts batch0.dat through batch9.dat to dataset_root/.
+    Source: Official UCI ML Repository (ID=224) - matches the 36-month drift paper.
+    """
+    root = Path(dataset_root)              # Wrap the target directory string in a Path object.
+
+    # If batch files already exist (either flat or under a Dataset/ subdir), do nothing.
+    if list(root.glob("batch*.dat")) or list(root.glob("Dataset/batch*.dat")):
+        print("Dataset batch files already found - skipping download")
+        return                             # Early exit: nothing to download.
+
+    # Inform the user a download is starting and where the data comes from.
+    print("No batch files found. Downloading UCI Gas Sensor Drift Dataset (~9.5MB)...")
+    print("   Source: https://archive.ics.uci.edu/static/public/224/gas+sensor+array+drift+dataset.zip")
+
+    # The canonical UCI download URL for dataset 224.
+    url = "https://archive.ics.uci.edu/static/public/224/gas+sensor+array+drift+dataset.zip"
+    try:
+        r = requests.get(url, timeout=30)  # Fetch the zip; abort if it takes longer than 30s.
+        r.raise_for_status()               # Raise an exception on any HTTP error (404, 500, etc.).
+
+        # Open the downloaded bytes as an in-memory zip and extract everything into root/.
+        with zipfile.ZipFile(BytesIO(r.content)) as zip_ref:
+            # The UCI archive contains a Dataset/ subdirectory holding the batch*.dat files.
+            zip_ref.extractall(root)
+
+        # Confirm success and report how many batch files were found after extraction.
+        print(f"Downloaded and extracted to {root.absolute()}")
+        print("   Found batches:", len(list(root.rglob("batch*.dat"))))
+
+    except Exception as e:
+        # Any failure (network, bad zip, etc.) is re-raised with a manual-download hint.
+        raise RuntimeError(f"Download failed: {e}\n"
+                          f"   Manual download: https://archive.ics.uci.edu/static/public/224/gas+sensor+array+drift+dataset.zip")
+
+def _try_read_csv(file_path: Path) -> pd.DataFrame | None:
+    """Try to read a file as a standard CSV; return None if it doesn't look tabular."""
+    try:
+        df = pd.read_csv(file_path)        # Attempt a normal CSV parse.
+        if df.shape[1] >= 10:              # Heuristic: a real sensor table has many columns.
+            return df                      # Looks tabular -> return the DataFrame.
+    except Exception:
+        return None                        # Parse error -> signal "not a CSV".
+    return None                            # Too few columns -> signal "not the format we want".
+
+def _parse_idxval_lines(file_path: Path, expected_sensors=128) -> pd.DataFrame:
+    """
+    Parse files where each row contains many 'index:value' pairs.
+    Produces columns R0..R127 (or whichever IDs are present).
+    """
+    rows = []                              # Accumulator for one dict per data row.
+    with open(file_path, "r", encoding="latin1") as f:  # latin1 avoids decode errors on raw bytes.
+        for line in f:                     # Process the file line by line.
+            line = line.strip()            # Drop leading/trailing whitespace and newline.
+            if ":" not in line:            # Lines without a colon can't hold index:value pairs.
+                continue                   # Skip them.
+            pairs = _IDXVAL_RE.findall(line)  # Extract all (index, value) tokens on this line.
+            if len(pairs) < 20:            # Too few pairs -> probably a header/garbage line.
+                continue                   # Skip it.
+
+            # Start a dense row with every sensor channel defaulting to NaN (missing).
+            vec = {f"R{i}": np.nan for i in range(expected_sensors)}
+            for idx_str, val_str in pairs:  # Fill in the channels actually present on this line.
+                idx = int(idx_str)         # Sensor index as an integer.
+                if 0 <= idx < expected_sensors:  # Guard against out-of-range indices.
+                    vec[f"R{idx}"] = float(val_str)  # Store the parsed sensor reading.
+            rows.append(vec)               # Add the completed row to the accumulator.
+
+    if not rows:                           # If nothing parsed, the file wasn't the expected format.
+        raise ValueError(f"No usable index:value rows found in {file_path}")
+    return pd.DataFrame(rows)              # Build a DataFrame from the list of row dicts.
+
+def parse_single_batch(batch_path: Path, batch_id: int) -> pd.DataFrame:
+    """
+    Parse one batch (either a directory of files or a single file).
+    Returns: DataFrame with R* columns plus optional Temp/RH/Class,
+             plus Batch and SampleIdx bookkeeping columns.
+    """
+    files = []                             # Will hold the list of files belonging to this batch.
+    if batch_path.is_dir():                # Case 1: the batch is a directory of files.
+        files = sorted(batch_path.glob("*.csv"))   # Prefer .csv files if present.
+        if not files:                      # No CSVs found...
+            files = sorted(batch_path.glob("*"))   # ...fall back to every file in the directory.
+    else:
+        files = [batch_path]               # Case 2: the batch is a single file.
+
+    batch_frames = []                      # Per-file DataFrames to be concatenated.
+    for fp in files:                       # Iterate over every file in the batch.
+        if fp.is_dir():                    # Skip nested directories (only want files).
+            continue
+
+        df_std = _try_read_csv(fp)         # First try the standard-CSV reader.
+        if df_std is not None:             # The file parsed cleanly as a CSV table.
+            df = df_std.copy()             # Work on a copy to avoid mutating the read result.
+
+            # --- Normalize common column names if present ---
+            # Map various spellings of Temp/Humidity/Class to canonical names.
+            rename_map = {}                # Source-column -> canonical-name mapping.
+            for c in df.columns:           # Inspect each column name.
+                cl = str(c).strip().lower()  # Normalize to lowercase for comparison.
+                if cl in ("temperature", "temp", "t"):
+                    rename_map[c] = "Temp"  # Temperature column.
+                elif cl in ("humidity", "rh", "h"):
+                    rename_map[c] = "RH"    # Relative-humidity column.
+                elif cl in ("class", "label", "gas"):
+                    rename_map[c] = "Class"  # Target/label column.
+            if rename_map:                 # Apply the renames only if any matched.
+                df = df.rename(columns=rename_map)
+
+            # If the file already has R0..R127 sensor columns, they are kept as-is.
+            # (Many UCI variants already provide sensor columns in this layout.)
+            batch_frames.append(df)        # Store the cleaned per-file frame.
+
+        else:
+            # Not a CSV table -> parse it as raw "index:value" lines instead.
+            df = _parse_idxval_lines(fp, expected_sensors=128)
+            batch_frames.append(df)        # Store the parsed frame.
+
+    df_batch = pd.concat(batch_frames, ignore_index=True)  # Stack all per-file frames vertically.
+
+    # Collect any R* sensor columns, sorted numerically by their index (R0, R1, ... R127).
+    sensor_cols = sorted([c for c in df_batch.columns if str(c).startswith("R")],
+                         key=lambda x: int(str(x)[1:]) if str(x)[1:].isdigit() else 10**9)
+
+    # Guarantee a full set of 128 channels; create any missing ones as all-NaN columns.
+    for i in range(128):
+        col = f"R{i}"
+        if col not in df_batch.columns:
+            df_batch[col] = np.nan
+
+    # Preserve optional environmental/label columns if they exist in this batch.
+    env_cols = []
+    for c in ["Temp", "RH", "Class"]:
+        if c in df_batch.columns:
+            env_cols.append(c)
+
+    # Reorder to a fixed schema: R0..R127 first, then any env/label columns.
+    df_batch = df_batch[[f"R{i}" for i in range(128)] + env_cols].copy()
+    df_batch["Batch"] = batch_id           # Tag every row with its batch ID (drift over time).
+    df_batch["SampleIdx"] = np.arange(len(df_batch), dtype=np.int32)  # Within-batch order index.
+
+    return df_batch                        # Return the standardized batch DataFrame.
+
+def merge_all_batches(dataset_root="UCI_Gas_Sensor_Drift_Dataset") -> pd.DataFrame:
+    """
+    Merge all batches with preserved Batch and SampleIdx columns.
+    Auto-downloads the dataset if batch files are missing.
+    Expected output in paper: 13,910 x (128 sensors + Temp + RH + Class).
+    """
+    print("=== UCI Gas Sensor Array Drift Dataset Fusion ===")
+
+    # Ensure the dataset is present on disk before trying to read it.
+    download_uci_gas_drift_if_missing(dataset_root)
+
+    root = Path(dataset_root)              # Root directory containing the batch files.
+
+    all_batches = []                       # Collected per-batch DataFrames.
+    for i in range(16):                    # Probe possible batch indices 0..15.
+        # Each batch may live under several naming conventions; try them in order.
+        candidates = [
+            root / f"batch_{i:02d}",       # e.g. batch_00/ directory.
+            root / f"batch_{i:02d}.csv",   # e.g. batch_00.csv file.
+            root / f"batch{i}.csv",        # e.g. batch0.csv file.
+            root / f"batch{i}",            # e.g. batch0/ directory.
+            root / "Dataset" / f"batch{i}.dat",  # UCI standard: Dataset/batch0.dat.
+            root / f"batch{i}.dat",        # Flat .dat file: batch0.dat.
+        ]
+        # Pick the first candidate path that actually exists, else None.
+        batch_path = next((p for p in candidates if p.exists()), None)
+        if batch_path is None:             # No file found for this index.
+            print(f"  ! Skipping batch {i}: not found")
+            continue                       # Move on to the next index.
+
+        df_b = parse_single_batch(batch_path, batch_id=i)  # Parse this batch.
+        print(f"  Batch {i:02d}: {df_b.shape[0]} samples, cols={df_b.shape[1]}")
+        all_batches.append(df_b)           # Keep the parsed batch.
+
+    if not all_batches:                    # No batches were found by direct file probing.
+        # FALLBACK: fetch the dataset via the ucimlrepo package instead.
+        print("No batch files found. Trying ucimlrepo fallback...")
+        try:
+            from ucimlrepo import fetch_ucirepo  # Imported lazily so it's optional.
+            gas_drift = fetch_ucirepo(id=224)     # Download dataset 224 through the API.
+            df_merged = gas_drift.data.original    # The combined original table.
+            df_merged["Batch"] = 0                 # Single-batch fallback (no per-batch split).
+            df_merged["SampleIdx"] = np.arange(len(df_merged))  # Sequential index.
+            df_merged.to_csv("gas_sensor_unified.csv", index=False)  # Cache to disk.
+            print(f"Fallback loaded: {df_merged.shape} via ucimlrepo")
+            return df_merged               # Return the fallback table.
+        except ImportError:
+            # ucimlrepo isn't installed and no files exist -> give actionable instructions.
+            raise FileNotFoundError(
+                f"No batches found under {dataset_root}\n"
+                f"Run: pip install ucimlrepo\n"
+                f"Or manual download: https://archive.ics.uci.edu/static/public/224/gas+sensor+array+drift+dataset.zip"
+            )
+
+    df_merged = pd.concat(all_batches, ignore_index=True)  # Stack all batches into one table.
+
+    df_merged.to_csv("gas_sensor_unified.csv", index=False)  # Persist the unified dataset.
+    print(f"Saved: gas_sensor_unified.csv ({df_merged.shape[0]} rows)")
+    return df_merged                       # Return the merged DataFrame.
+
+# =============================================================================
+# 2) MISSING DATA + OUTLIER HANDLING (Batch 0-3 stats; per-batch outliers)
+# =============================================================================
+
+def clean_gas_data(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, SimpleImputer]:
+    """
+    Matches paper:
+    - Missing values imputed using feature-wise means from non-drifted batches (0-3).
+    - Outliers: >4 sigma from batch medians, then interpolated using temporal neighbors.
+    """
+    print("\n=== Data Cleaning (Batch 0-3 imputation; per-batch 4 sigma outliers) ===")
+
+    sensor_cols = [f"R{i}" for i in range(128)]              # The 128 sensor channels.
+    env_cols = [c for c in ["Temp", "RH"] if c in df_raw.columns]  # Optional env features present.
+    feature_cols = sensor_cols + env_cols                   # Full feature set to clean.
+
+    df = df_raw.copy()                     # Work on a copy; leave the caller's frame untouched.
+
+    # Restrict imputer fitting to the early, non-drifted batches (0-3) only.
+    df_early = df[df["Batch"].isin([0, 1, 2, 3])][feature_cols].copy()
+
+    # Drop columns that are entirely NaN in the early batches (the imputer can't learn a mean for them).
+    cols_to_impute = df_early.columns[~df_early.isna().all()].tolist()
+
+    imputer = SimpleImputer(strategy="mean")  # Mean-imputation strategy.
+    # Fit the imputer using ONLY the early-batch statistics on imputable columns.
+    imputer.fit(df_early[cols_to_impute])
+
+    # Apply the early-batch means to fill missing values across ALL rows for those columns.
+    df[cols_to_impute] = imputer.transform(df[cols_to_impute])
+
+    # Sort by (Batch, SampleIdx) so temporal interpolation respects acquisition order.
+    df_sorted = df.sort_values(["Batch", "SampleIdx"]).reset_index(drop=True)
+
+    for b in sorted(df_sorted["Batch"].unique()):  # Process each batch independently.
+        mask_b = df_sorted["Batch"] == b   # Boolean mask selecting this batch's rows.
+        Xb = df_sorted.loc[mask_b, feature_cols]  # This batch's feature block.
+
+        med = Xb.median()                  # Per-feature median for this batch.
+        std = Xb.std().replace(0, np.nan)  # Per-feature std; zero std -> NaN to avoid div-by-zero.
+
+        # Flag any value more than 4 standard deviations from its batch median as an outlier.
+        outlier_mask = (np.abs(Xb - med) > (4.0 * std))
+        df_sorted.loc[mask_b, feature_cols] = Xb.mask(outlier_mask)  # Replace outliers with NaN.
+
+        # Fill the newly-created NaNs by linear interpolation along the time axis within the batch.
+        df_sorted.loc[mask_b, feature_cols] = (
+            df_sorted.loc[mask_b, feature_cols]
+            .interpolate(method="linear", limit_direction="both")
+        )
+
+    # Report how many missing values remain after cleaning (ideally zero).
+    print(f"After cleaning: remaining NaNs = {df_sorted[feature_cols].isna().sum().sum()}")
+    return df_sorted, imputer              # Return the cleaned frame and the fitted imputer.
+
+# =============================================================================
+# 3) CORRELATION-DRIVEN FEATURE SELECTION (keep 24 sensors)
+# =============================================================================
+
+def correlation_feature_selection(df: pd.DataFrame,
+                                 corr_threshold=0.95,
+                                 target_features=24) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Matches paper:
+    Retain Ri if max_j!=i |rho(Ri,Rj)| < 0.95 and Var(Ri) > median(Var).
+    Output: 24 sensor channels (R*).
+    """
+    print("\n=== Correlation-Driven Feature Selection ===")
+
+    sensor_cols = [f"R{i}" for i in range(128)]            # Candidate sensor columns.
+    X = df[sensor_cols].to_numpy(dtype=np.float64)         # Dense matrix of sensor readings.
+
+    corr = np.corrcoef(X.T)                # Full 128x128 correlation matrix between sensors.
+    variances = np.var(X, axis=0)          # Per-sensor variance (informativeness proxy).
+    var_median = np.median(variances)      # Median variance, used as a low-information cutoff.
+
+    selected = []                          # Indices of sensors we decide to keep.
+    remaining = list(range(len(sensor_cols)))  # Indices still available for selection.
+
+    while len(selected) < target_features and remaining:  # Keep going until we have enough or run out.
+        best = None                        # Best candidate index found this round.
+        best_score = -np.inf               # Best score so far (higher is better).
+
+        for idx in remaining:              # Evaluate every still-available sensor.
+            if variances[idx] <= var_median:  # Skip low-variance (uninformative) sensors.
+                continue
+            if selected:                   # If we already picked some sensors...
+                max_corr = np.max(np.abs(corr[idx, selected]))  # ...max correlation to them.
+                if max_corr >= corr_threshold:  # Too correlated -> redundant, skip it.
+                    continue
+                # Score rewards high variance and penalizes correlation with chosen sensors.
+                score = variances[idx] - 10.0 * max_corr
+            else:
+                score = variances[idx]     # First pick: just use raw variance.
+            if score > best_score:         # Track the best-scoring candidate.
+                best_score = score
+                best = idx
+
+        if best is None:                   # No candidate satisfied the constraints -> stop early.
+            break
+        selected.append(best)              # Commit the best candidate.
+        remaining.remove(best)             # Remove it from the pool.
+
+    selected_cols = [sensor_cols[i] for i in selected]     # Map indices back to column names.
+    print(f"Selected {len(selected_cols)} sensor features (target={target_features})")
+    return df, selected_cols               # Return the frame and the chosen column list.
+
+# =============================================================================
+# 4) TRAIN-ONLY QUANTIZATION + ENGINEERED FEATURES (match embedded: 28 total)
+# =============================================================================
+
+def compute_engineered_features(df: pd.DataFrame, base_cols: list[str]) -> pd.DataFrame:
+    """
+    Adds two engineered features described in the embedded pipeline:
+    - drift_rate: coarse baseline-drift proxy (difference of a slow rolling mean).
+    - age: deployment-age proxy (SampleIdx scaled).
+    Both are computed deterministically so they can be mirrored on the MCU.
+    """
+    out = df.copy()                        # Copy so the original frame is unchanged.
+
+    # Cheap, stable per-sample baseline: the mean across the selected sensors.
+    mean_sig = out[base_cols].mean(axis=1)
+
+    # Slow EWMA of that baseline approximates the slowly-moving sensor baseline (drift).
+    ewma = mean_sig.ewm(alpha=0.01, adjust=False).mean()
+    # The first difference of the EWMA approximates the instantaneous drift rate.
+    drift = ewma.diff().fillna(0.0)        # First row has no previous value -> fill with 0.
+
+    out["drift_rate"] = drift              # Store the drift-rate feature.
+    out["age"] = out["SampleIdx"].astype(np.float64)  # Use sample index as a deployment-age proxy.
+    return out                             # Return frame augmented with the two engineered features.
+
+def quantize_train_only(df: pd.DataFrame,
+                        sensor_cols_24: list[str],
+                        temp_range=(15, 40),
+                        rh_range=(30, 90),
+                        random_state=42):
+    """
+    Matches paper:
+    - Split first (stratified).
+    - Compute min/max on TRAIN ONLY.
+    - Apply the same scaling to val/test.
+    Also appends Temp_q/RH_q/drift_rate_q/age_q => 28 features total.
+    """
+    print("\n=== Train-Only Quantization (paper-consistent) ===")
+
+    if "Class" not in df.columns:          # The label column must exist to train.
+        # Fallback so the function doesn't crash; replace with the real label mapping for actual runs.
+        df = df.copy()
+        df["Class"] = "Good"
+
+    # Convert the textual class into a binary target: 0 = Good/clean air, 1 = Poor/everything else.
+    y_text = df["Class"].astype(str).fillna("Good")  # Normalize to strings; treat missing as "Good".
+    y = y_text.apply(lambda s: 0 if s.lower() in ("good", "clean", "background", "air") else 1).to_numpy(dtype=np.int32)
+
+    df_feat = compute_engineered_features(df, sensor_cols_24)  # Add drift_rate and age features.
+
+    # Split BEFORE quantization so min/max bounds are derived from TRAIN data only (no leakage).
+    X_train_df, X_tmp_df, y_train, y_tmp = train_test_split(
+        df_feat, y, test_size=0.4, random_state=random_state, stratify=y
+    )
+    # Split the held-out 40% evenly into validation and test sets.
+    X_val_df, X_test_df, y_val, y_test = train_test_split(
+        X_tmp_df, y_tmp, test_size=0.5, random_state=random_state, stratify=y_tmp
+    )
+
+    # Quantization parameters (min/span) are computed from the TRAIN split only.
+    q_params = {}                          # Will hold per-feature scaling parameters.
+    # NOTE: The original list of feature columns was incomplete and caused a SyntaxError.
+    # Per the docstring ("appends Temp_q/RH_q/drift_rate_q/age_q => 28 features"), the
+    # remaining columns are Temp, RH, drift_rate, and age.
+    for col in sensor_cols_24 + ["Temp", "RH", "drift_rate", "age"]:
+        # NOTE: The original source ended here, so the loop body was never provided.
+        # 'pass' keeps the function syntactically valid until the quantization logic is restored.
+        pass
+
+
+def train_mcu_decision_tree(
+        X_train,                           # Quantized training features.
+        X_val,                             # Quantized validation features.
+        X_test,                            # Quantized test features.
+        y_train,                           # Training labels.
+        y_val,                             # Validation labels.
+        y_test,                            # Test labels.
+        max_depth=8,                       # Depth cap keeps the tree small enough for the MCU.
+        min_samples_leaf=10):              # Minimum samples per leaf prevents tiny overfit leaves.
+
+    print("\n=== MCU-Constrained Decision Tree Training ===")
+
+    # Configure a constrained decision tree suitable for 8-bit embedded deployment.
+    dt = DecisionTreeClassifier(
+        max_depth=max_depth,               # Bound depth (deterministic, compact traversal).
+        min_samples_leaf=min_samples_leaf, # Regularize leaf size.
+        max_features=0.6,                  # Consider 60% of features per split (adds robustness).
+        random_state=42,                   # Reproducible training.
+        ccp_alpha=0.001                    # Cost-complexity pruning to trim the tree.
+    )
+
+    dt.fit(X_train, y_train)               # Train the tree on the quantized training set.
+
+    # -------------------------------------------------------
+    # Predictions
+    # -------------------------------------------------------
+    train_pred = dt.predict(X_train)       # Hard class predictions on train.
+    val_pred = dt.predict(X_val)           # Hard class predictions on validation.
+    test_pred = dt.predict(X_test)         # Hard class predictions on test.
+
+    train_prob = dt.predict_proba(X_train) # Class probabilities on train (for loss/AUC).
+    val_prob = dt.predict_proba(X_val)     # Class probabilities on validation.
+    test_prob = dt.predict_proba(X_test)   # Class probabilities on test.
+
+    # -------------------------------------------------------
+    # Accuracy
+    # -------------------------------------------------------
+    train_acc = accuracy_score(y_train, train_pred)  # Fraction correct on train.
+    val_acc = accuracy_score(y_val, val_pred)        # Fraction correct on validation.
+    test_acc = accuracy_score(y_test, test_pred)     # Fraction correct on test.
+
+    # -------------------------------------------------------
+    # Loss
+    # -------------------------------------------------------
+    train_loss = log_loss(y_train, train_prob)  # Cross-entropy loss on train.
+    val_loss = log_loss(y_val, val_prob)         # Cross-entropy loss on validation.
+    test_loss = log_loss(y_test, test_prob)      # Cross-entropy loss on test.
+
+    # -------------------------------------------------------
+    # Precision
+    # -------------------------------------------------------
+    train_precision = precision_score(     # Precision on train (binary positive class).
+        y_train, train_pred,
+        average='binary',
+        zero_division=0                    # Return 0 instead of error when denominator is 0.
+    )
+
+    val_precision = precision_score(       # Precision on validation.
+        y_val, val_pred,
+        average='binary',
+        zero_division=0
+    )
+
+    test_precision = precision_score(      # Precision on test.
+        y_test, test_pred,
+        average='binary',
+        zero_division=0
+    )
+
+    # -------------------------------------------------------
+    # Recall
+    # -------------------------------------------------------
+    train_recall = recall_score(           # Recall on train (binary positive class).
+        y_train, train_pred,
+        average='binary',
+        zero_division=0
+    )
+
+    val_recall = recall_score(             # Recall on validation.
+        y_val, val_pred,
+        average='binary',
+        zero_division=0
+    )
+
+    test_recall = recall_score(            # Recall on test.
+        y_test, test_pred,
+        average='binary',
+        zero_division=0
+    )
+
+    # -------------------------------------------------------
+    # F1 Score
+    # -------------------------------------------------------
+    train_f1 = f1_score(                   # F1 (harmonic mean of precision/recall) on train.
+        y_train, train_pred,
+        average='binary',
+        zero_division=0
+    )
+
+    val_f1 = f1_score(                     # F1 on validation.
+        y_val, val_pred,
+        average='binary',
+        zero_division=0
+    )
+
+    test_f1 = f1_score(                    # F1 on test.
+        y_test, test_pred,
+        average='binary',
+        zero_division=0
+    )
+
+    # -------------------------------------------------------
+    # ROC AUC
+    # -------------------------------------------------------
+    try:
+        # AUC uses the positive-class probability (column 1).
+        train_auc = roc_auc_score(y_train, train_prob[:, 1])
+        val_auc = roc_auc_score(y_val, val_prob[:, 1])
+        test_auc = roc_auc_score(y_test, test_prob[:, 1])
+    except:
+        # AUC is undefined if a split has only one class present; fall back to NaN.
+        train_auc = np.nan
+        val_auc = np.nan
+        test_auc = np.nan
+
+    # -------------------------------------------------------
+    # Print Results
+    # -------------------------------------------------------
+
+    print("\n==============================================================")
+    print("               MODEL PERFORMANCE SUMMARY")
+    print("==============================================================")
+
+    # Column header for the metrics table.
+    print(f"{'Metric':<15}{'Train':>12}{'Validation':>15}{'Test':>12}")
+    print("-"*58)
+
+    # One formatted row per metric across the three splits.
+    print(f"{'Accuracy':<15}{train_acc:12.4f}{val_acc:15.4f}{test_acc:12.4f}")
+    print(f"{'Loss':<15}{train_loss:12.4f}{val_loss:15.4f}{test_loss:12.4f}")
+    print(f"{'Precision':<15}{train_precision:12.4f}{val_precision:15.4f}{test_precision:12.4f}")
+    print(f"{'Recall':<15}{train_recall:12.4f}{val_recall:15.4f}{test_recall:12.4f}")
+    print(f"{'F1 Score':<15}{train_f1:12.4f}{val_f1:15.4f}{test_f1:12.4f}")
+    print(f"{'ROC AUC':<15}{train_auc:12.4f}{val_auc:15.4f}{test_auc:12.4f}")
+
+    print("\n--------------------------------------------------------------")
+    print(f"Tree Nodes : {dt.tree_.node_count}")   # Total nodes (drives flash footprint).
+    print(f"Tree Depth : {dt.tree_.max_depth}")    # Achieved depth after pruning.
+    print("--------------------------------------------------------------")
+
+    # -------------------------------------------------------
+    # Test Confusion Matrix
+    # -------------------------------------------------------
+    cm = confusion_matrix(y_test, test_pred)  # Confusion matrix on the test set.
+
+    print("\nConfusion Matrix (Test)")
+    print(cm)
+
+    # -------------------------------------------------------
+    # Classification Report
+    # -------------------------------------------------------
+    print("\nClassification Report (Test)")
+    print(classification_report(           # Per-class precision/recall/F1 summary.
+        y_test,
+        test_pred,
+        digits=4,
+        zero_division=0
+    ))
+
+    return dt                              # Return the trained tree for export/deployment.        
+
+
+
+    #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+make_figures.py
+===============
+Generates the publication figures recommended for the TinyML / 8051 paper,
+as PNG images, REUSING the exact same pipeline as generate_all_tables.py so
+that figures and tables can never disagree.
+
+Figures produced (all from the GSAD desktop pipeline):
+  drift_curve.png                 Accuracy vs batch index (drift)
+  drift_heatmap.png               Per-class accuracy x batch (which gas drifts first)
+  depth_ablation.png              Accuracy + node count vs tree depth
+  float_vs_int8.png               Quantization ablation, grouped bars
+  confusion_matrix.png            Confusion matrix heatmap (deployed tree)
+  gamma_sweep.png                 Confidence-threshold sweep (AQI filtering)
+  corr_heatmap.png                128x128 sensor correlation, selected highlighted
+  quant_error_hist.png            Float - dequantized error distribution
+  tree_structure.png              Rendered (compact) decision tree
+
+NOT produced here (need the board / external assets):
+  - Desktop-vs-MCU bar (MCU bar is a [BOARD] number)
+  - Memory-footprint breakdown ([BOARD] linker map)
+  - Pipeline block diagram (schematic you draw)
+  - Prototype photo / UART trace ([photo] / [BOARD])
+
+Run:  python make_figures.py
+Deps: numpy, scikit-learn, matplotlib, requests  (all preinstalled on Colab)
+Output: ./figures/*.png
+"""
+
+import re                                          # Parse the GSAD index:value format.
+import zipfile                                     # Extract the dataset archive.
+from io import BytesIO                             # In-memory file for zipfile.
+from pathlib import Path                           # Path handling.
+
+import numpy as np                                 # Core numerics.
+import requests                                    # Auto-download the dataset.
+
+import matplotlib                                  # Plotting backend control.
+matplotlib.use("Agg")                              # Headless backend (no display needed).
+import matplotlib.pyplot as plt                    # Pyplot interface.
+from matplotlib.colors import LinearSegmentedColormap  # For a clean custom heatmap.
+
+from sklearn.tree import DecisionTreeClassifier, plot_tree  # Model + tree renderer.
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix  # Scoring.
+
+# =============================================================================
+# 0) CONFIG  - identical to generate_all_tables.py (single source of truth)
+# =============================================================================
+
+SEED = 42                                          # Reproducibility seed.
+N_KEEP = 8                                          # Features kept after selection.
+N_CLASSES = 6                                       # GSAD gas classes.
+DEPTH_DEPLOYED = 10                                 # Deployed tree depth.
+CLASS_NAMES = ["Ethanol", "Ethylene", "Ammonia",   # Class index -> name.
+               "Acetaldehyde", "Acetone", "Toluene"]
+DT_PARAMS = dict(max_depth=DEPTH_DEPLOYED,          # Deployed-tree hyperparameters.
+                 min_samples_leaf=10,
+                 random_state=SEED)
+DATASET_ROOT = "gsad"                               # Where batch*.dat live.
+TRAIN_BATCHES = [1, 2, 3, 4, 5]                     # Early (low-drift) batches.
+TEST_BATCHES = [6, 7, 8, 9, 10]                     # Late (high-drift) batches.
+
+OUTDIR = Path("figures")                            # Output directory for PDFs.
+OUTDIR.mkdir(exist_ok=True)                          # Create it if absent.
+
+# ---- Shared matplotlib styling for a consistent, publication look ----
+plt.rcParams.update({
+    "figure.dpi": 150,                              # On-screen render quality.
+    "savefig.dpi": 300,                             # Saved-figure resolution.
+    "font.size": 10,                                # Base font size.
+    "axes.titlesize": 11,                           # Title size.
+    "axes.labelsize": 10,                           # Axis-label size.
+    "axes.spines.top": False,                       # Drop top spine (cleaner).
+    "axes.spines.right": False,                     # Drop right spine.
+    "figure.autolayout": True,                      # Auto tight layout.
+})
+# A restrained blue used as the primary accent across figures.
+ACCENT = "#2c6fbb"
+
+# =============================================================================
+# 1) DATA + PIPELINE  (copied verbatim from the table generator's logic)
+# =============================================================================
+
+_IDXVAL_RE = re.compile(r'(\d+):([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)')  # index:value token.
+
+def download_gsad_if_missing(root=DATASET_ROOT):
+    """Download + extract UCI GSAD (id 224) if the batch files are missing."""
+    rootp = Path(root)                              # Target dir as Path.
+    rootp.mkdir(exist_ok=True)                      # Ensure it exists.
+    if list(rootp.glob("batch*.dat")) or list(rootp.glob("**/batch*.dat")):
+        print("[data] GSAD batch files already present")
+        return                                      # Nothing to do.
+    url = "https://archive.ics.uci.edu/static/public/224/gas+sensor+array+drift+dataset.zip"
+    print("[data] downloading GSAD (~9.5 MB) ...")
+    r = requests.get(url, timeout=60)               # Fetch archive.
+    r.raise_for_status()                            # Fail on HTTP error.
+    with zipfile.ZipFile(BytesIO(r.content)) as z:  # Open zip in memory.
+        z.extractall(rootp)                         # Extract to target dir.
+    print("[data] extracted to", rootp.resolve())
+
+def _parse_dat(path):
+    """Parse one GSAD .dat into (X[:,128], y) with 0-based labels."""
+    X_rows, y_rows = [], []                         # Accumulators.
+    with open(path, "r", encoding="latin1") as f:   # Tolerant decode.
+        for line in f:                              # One sample per line.
+            line = line.strip()
+            if not line or ":" not in line:         # Skip blank/malformed.
+                continue
+            head = re.split(r'[;\s]', line, maxsplit=1)[0]  # Label is first token.
+            try:
+                label = int(float(head))            # Parse gas class.
+            except ValueError:
+                continue                            # Skip bad lines.
+            if not (1 <= label <= N_CLASSES):       # Range guard.
+                continue
+            pairs = _IDXVAL_RE.findall(line)        # Sensor tokens.
+            vec = np.full(128, np.nan)              # Dense row.
+            for idx_str, val_str in pairs:          # Fill channels.
+                idx = int(idx_str)
+                if 1 <= idx <= 128:
+                    vec[idx - 1] = float(val_str)
+            X_rows.append(vec)                      # Keep features.
+            y_rows.append(label - 1)                # 0-based label.
+    return np.asarray(X_rows), np.asarray(y_rows)
+
+def load_batches(batch_ids):
+    """Load + stack the given batch numbers into (X, y), NaN-filled by col mean."""
+    rootp = Path(DATASET_ROOT)
+    Xs, ys = [], []                                 # Per-batch arrays.
+    for b in batch_ids:                             # For each batch id...
+        cands = [rootp / f"batch{b}.dat", rootp / "Dataset" / f"batch{b}.dat"]
+        path = next((p for p in cands if p.exists()), None)
+        if path is None:
+            print(f"[data] WARNING: batch{b}.dat not found")
+            continue
+        Xb, yb = _parse_dat(path)                   # Parse it.
+        Xs.append(Xb); ys.append(yb)
+    X = np.vstack(Xs)                               # Stack features.
+    y = np.concatenate(ys)                          # Concat labels.
+    col_mean = np.nanmean(X, axis=0)                # Column means.
+    inds = np.where(np.isnan(X))                    # Remaining NaNs.
+    X[inds] = np.take(col_mean, inds[1])            # Fill with means.
+    return X, y
+
+def select_features(X, y, n_keep=N_KEEP, corr_threshold=0.95):
+    """Greedy low-redundancy high-variance selection; returns column indices."""
+    corr = np.corrcoef(X.T)                         # Correlation matrix.
+    variances = np.var(X, axis=0)                   # Per-channel variance.
+    var_median = np.median(variances)               # Cutoff.
+    selected, remaining = [], list(range(X.shape[1]))
+    while len(selected) < n_keep and remaining:     # Greedy loop.
+        best, best_score = None, -np.inf
+        for idx in remaining:
+            if variances[idx] <= var_median:
+                continue
+            if selected:
+                max_corr = np.max(np.abs(corr[idx, selected]))
+                if max_corr >= corr_threshold:
+                    continue
+                score = variances[idx] - 10.0 * max_corr
+            else:
+                score = variances[idx]
+            if score > best_score:
+                best_score, best = score, idx
+        if best is None:
+            break
+        selected.append(best); remaining.remove(best)
+    return selected
+
+def fit_bounds(Xtr):
+    """Per-feature Qmin and span from TRAIN only."""
+    qmin = Xtr.min(axis=0)                          # Minimums.
+    qmax = Xtr.max(axis=0)                          # Maximums.
+    span = np.where(qmax > qmin, qmax - qmin, 1.0)  # Safe span.
+    return qmin, span
+
+def quantize(X, qmin, span):
+    """uint8 quantization matching the firmware equation."""
+    xq = np.round(255.0 * (X - qmin) / span)        # Scale + round.
+    return np.clip(xq, 0, 255).astype(np.int32)     # Clamp to 0..255.
+
+def savefig(fig, name):
+    """Save a figure as a PNG in the output dir and report it."""
+    path = OUTDIR / name                            # Full output path.
+    fig.savefig(path, bbox_inches="tight")          # Write tight-cropped PNG (300 dpi).
+    plt.close(fig)                                  # Free the figure.
+    print(f"[fig] wrote {path}")
+
+# =============================================================================
+# 2) FIGURE BUILDERS
+# =============================================================================
+
+def fig1_drift_curve(dtA, colsA, qminA, spanA):
+    """FIG 1: overall accuracy vs batch index (the drift trend)."""
+    batches, accs = [], []                          # X (batch) and Y (accuracy).
+    for b in range(2, 11):                          # Test batches 2..10.
+        Xb, yb = load_batches([b])                  # Load each test batch.
+        pb = dtA.predict(quantize(Xb[:, colsA], qminA, spanA))  # Predict.
+        batches.append(b)                           # Record batch index.
+        accs.append(accuracy_score(yb, pb) * 100)   # Record accuracy.
+    fig, ax = plt.subplots(figsize=(6, 3.6))        # New figure.
+    ax.plot(batches, accs, marker="o", color=ACCENT, linewidth=2)  # Trend line.
+    ax.set_xlabel("Test batch index (time ->)")     # X label.
+    ax.set_ylabel("Accuracy (%)")                   # Y label.
+    ax.set_title("Classification accuracy degrades under sensor drift")  # Title.
+    ax.set_ylim(0, 100)                             # Fix y-range for honesty.
+    ax.grid(True, axis="y", alpha=0.3)              # Light horizontal grid.
+    savefig(fig, "drift_curve.png")
+
+def fig2_drift_heatmap(dtA, colsA, qminA, spanA):
+    """FIG 2: per-class accuracy across batches (which gas drifts first)."""
+    grid = np.full((N_CLASSES, 9), np.nan)          # rows=class, cols=batch 2..10.
+    for j, b in enumerate(range(2, 11)):            # For each later batch.
+        Xb, yb = load_batches([b])                  # Load it.
+        pb = dtA.predict(quantize(Xb[:, colsA], qminA, spanA))  # Predict.
+        cm = confusion_matrix(yb, pb, labels=range(N_CLASSES))  # Per-class counts.
+        for c in range(N_CLASSES):                  # Per-class accuracy.
+            tot = cm[c].sum()
+            grid[c, j] = (100 * cm[c, c] / tot) if tot else np.nan
+    fig, ax = plt.subplots(figsize=(6.5, 4))        # New figure.
+    cmap = LinearSegmentedColormap.from_list("acc", ["#b2182b", "#f7f7f7", "#2166ac"])  # Red->blue.
+    im = ax.imshow(grid, aspect="auto", cmap=cmap, vmin=0, vmax=100)  # Heatmap.
+    ax.set_xticks(range(9))                          # Batch ticks.
+    ax.set_xticklabels(range(2, 11))
+    ax.set_yticks(range(N_CLASSES))                  # Class ticks.
+    ax.set_yticklabels(CLASS_NAMES)
+    ax.set_xlabel("Test batch index (time ->)")
+    ax.set_title("Per-class accuracy under drift (which gas degrades first)")
+    for c in range(N_CLASSES):                       # Annotate each cell.
+        for j in range(9):
+            v = grid[c, j]
+            if v == v:                               # Skip NaN.
+                ax.text(j, c, f"{v:.0f}", ha="center", va="center",
+                        fontsize=7, color="black")
+    fig.colorbar(im, ax=ax, label="Accuracy (%)")    # Color scale.
+    savefig(fig, "drift_heatmap.png")
+
+def fig3_depth_ablation(Xtr_q, ytr, Xte_q, yte):
+    """FIG 3: accuracy and node count vs tree depth (twin y-axes)."""
+    depths, accs, nodes = [], [], []                 # Sweep accumulators.
+    for d in range(3, 13):                           # Depth 3..12.
+        params = dict(DT_PARAMS); params["max_depth"] = d  # Override depth.
+        m = DecisionTreeClassifier(**params).fit(Xtr_q, ytr)  # Train.
+        depths.append(d)
+        accs.append(accuracy_score(yte, m.predict(Xte_q)) * 100)  # Accuracy.
+        nodes.append(m.tree_.node_count)             # Node count.
+    fig, ax1 = plt.subplots(figsize=(6, 3.8))        # Primary axis.
+    ax1.plot(depths, accs, marker="o", color=ACCENT, linewidth=2, label="Accuracy")
+    ax1.set_xlabel("Tree depth")
+    ax1.set_ylabel("Accuracy (%)", color=ACCENT)
+    ax1.tick_params(axis="y", labelcolor=ACCENT)
+    ax1.axvline(DEPTH_DEPLOYED, color="gray", linestyle="--", alpha=0.7)  # Deployed marker.
+    ax1.text(DEPTH_DEPLOYED, ax1.get_ylim()[0], " deployed",
+             color="gray", va="bottom", fontsize=8)
+    ax2 = ax1.twinx()                                # Secondary axis for nodes.
+    ax2.spines["right"].set_visible(True)            # Re-enable right spine here.
+    ax2.plot(depths, nodes, marker="s", color="#c0504d", linewidth=1.5,
+             linestyle=":", label="Node count")
+    ax2.set_ylabel("Tree node count", color="#c0504d")
+    ax2.tick_params(axis="y", labelcolor="#c0504d")
+    ax1.set_title("Accuracy vs depth and the resulting tree size")
+    savefig(fig, "depth_ablation.png")
+
+def fig4_float_vs_int8(Xtr_full, ytr, Xte_full, yte, cols, qmin, span):
+    """FIG 4: float vs int8 grouped bars across acc/prec/rec/F1."""
+    from sklearn.metrics import precision_score, recall_score  # Local import for clarity.
+    dt_f = DecisionTreeClassifier(**DT_PARAMS).fit(Xtr_full[:, cols], ytr)  # Float tree.
+    dt_q = DecisionTreeClassifier(**DT_PARAMS).fit(quantize(Xtr_full[:, cols], qmin, span), ytr)
+    pf = dt_f.predict(Xte_full[:, cols])             # Float predictions.
+    pq = dt_q.predict(quantize(Xte_full[:, cols], qmin, span))  # Int8 predictions.
+    def metrics(pred):                               # Helper -> 4 macro metrics.
+        return [accuracy_score(yte, pred) * 100,
+                precision_score(yte, pred, average="macro", zero_division=0) * 100,
+                recall_score(yte, pred, average="macro", zero_division=0) * 100,
+                f1_score(yte, pred, average="macro", zero_division=0) * 100]
+    mf, mq = metrics(pf), metrics(pq)                # Float / int8 metric vectors.
+    labels = ["Accuracy", "Precision", "Recall", "F1"]
+    x = np.arange(len(labels)); w = 0.38             # Bar positions / width.
+    fig, ax = plt.subplots(figsize=(6, 3.8))
+    ax.bar(x - w/2, mf, w, label="Float", color="#9ecae1")    # Float bars.
+    ax.bar(x + w/2, mq, w, label="8-bit int", color=ACCENT)   # Int8 bars.
+    ax.set_xticks(x); ax.set_xticklabels(labels)
+    ax.set_ylabel("Score (%)"); ax.set_ylim(0, 100)
+    ax.set_title("Quantization is nearly lossless (float vs 8-bit)")
+    ax.legend()
+    for i in range(len(labels)):                     # Value labels above bars.
+        ax.text(x[i] - w/2, mf[i] + 1, f"{mf[i]:.0f}", ha="center", fontsize=7)
+        ax.text(x[i] + w/2, mq[i] + 1, f"{mq[i]:.0f}", ha="center", fontsize=7)
+    savefig(fig, "float_vs_int8.png")
+
+def fig5_confusion_matrix(dt, Xte_q, yte):
+    """FIG 5: confusion-matrix heatmap for the deployed tree."""
+    cm = confusion_matrix(yte, dt.predict(Xte_q), labels=range(N_CLASSES))  # Counts.
+    fig, ax = plt.subplots(figsize=(5.2, 4.6))
+    im = ax.imshow(cm, cmap="Blues")                 # Blue heatmap.
+    ax.set_xticks(range(N_CLASSES)); ax.set_yticks(range(N_CLASSES))
+    ax.set_xticklabels(CLASS_NAMES, rotation=45, ha="right")
+    ax.set_yticklabels(CLASS_NAMES)
+    ax.set_xlabel("Predicted class"); ax.set_ylabel("True class")
+    ax.set_title("Confusion matrix (deployed quantized tree)")
+    thresh = cm.max() / 2.0 if cm.max() else 1       # Text color threshold.
+    for i in range(N_CLASSES):                        # Annotate counts.
+        for j in range(N_CLASSES):
+            ax.text(j, i, cm[i, j], ha="center", va="center",
+                    color="white" if cm[i, j] > thresh else "black", fontsize=8)
+    fig.colorbar(im, ax=ax, label="Sample count")
+    savefig(fig, "confusion_matrix.png")
+
+def fig6_gamma_sweep(dt, Xte_q, yte):
+    """FIG 6: confidence-threshold sweep - fraction kept and false-alarm rate."""
+    proba = dt.predict_proba(Xte_q)                  # Leaf probabilities.
+    conf = (proba.max(axis=1) * 255).astype(int)     # 8-bit confidence.
+    pred = dt.predict(Xte_q)                         # Predicted classes.
+    hazardous = {2, 3, 4, 5}                          # Set H (EDIT to your AQI mapping).
+    true_poor = np.isin(yte, list(hazardous))        # Ground-truth POOR.
+    gammas = list(range(0, 256, 10))                 # Sweep 0..250.
+    kept, fa = [], []                                # Outputs per gamma.
+    for g in gammas:
+        keep = conf >= g                             # Confident-enough mask.
+        kept.append(100.0 * keep.mean())             # % decisions kept.
+        if keep.sum() > 0:
+            pred_poor = np.isin(pred, list(hazardous)) & keep
+            fa.append(100.0 * np.mean(pred_poor[keep] & (~true_poor[keep])))
+        else:
+            fa.append(np.nan)
+    fig, ax1 = plt.subplots(figsize=(6, 3.8))
+    ax1.plot(gammas, kept, color=ACCENT, marker=".", label="Decisions kept (%)")
+    ax1.set_xlabel("Confidence threshold gamma (0-255)")
+    ax1.set_ylabel("Decisions kept (%)", color=ACCENT)
+    ax1.tick_params(axis="y", labelcolor=ACCENT)
+    ax2 = ax1.twinx()                                # Second axis for false alarms.
+    ax2.spines["right"].set_visible(True)
+    ax2.plot(gammas, fa, color="#c0504d", marker=".", linestyle=":",
+             label="False-alarm rate (%)")
+    ax2.set_ylabel("False-alarm rate (%)", color="#c0504d")
+    ax2.tick_params(axis="y", labelcolor="#c0504d")
+    ax1.set_title("Confidence filtering trades coverage for fewer false alarms")
+    savefig(fig, "gamma_sweep.png")
+
+def fig7_corr_heatmap(Xtr_full, cols):
+    """FIG 7: 128x128 sensor correlation with selected channels marked."""
+    corr = np.corrcoef(Xtr_full.T)                   # Full correlation matrix.
+    fig, ax = plt.subplots(figsize=(5.4, 4.8))
+    im = ax.imshow(np.abs(corr), cmap="viridis", vmin=0, vmax=1)  # |corr| heatmap.
+    ax.set_title("Sensor correlation |rho| (selected channels marked)")
+    ax.set_xlabel("Sensor index"); ax.set_ylabel("Sensor index")
+    for ci in cols:                                  # Mark selected channels.
+        ax.axhline(ci, color="red", linewidth=0.4, alpha=0.6)
+        ax.axvline(ci, color="red", linewidth=0.4, alpha=0.6)
+    fig.colorbar(im, ax=ax, label="|correlation|")
+    savefig(fig, "corr_heatmap.png")
+
+def fig8_quant_error_hist(Xtr_full, cols, qmin, span):
+    """FIG 8: distribution of (float - dequantized) reconstruction error."""
+    Xsel = Xtr_full[:, cols]                          # Selected float features.
+    xq = quantize(Xsel, qmin, span)                  # Quantize them.
+    deq = qmin + (xq / 255.0) * span                 # Dequantize back to float.
+    err = (Xsel - deq).ravel()                       # Reconstruction error.
+    fig, ax = plt.subplots(figsize=(6, 3.6))
+    ax.hist(err, bins=60, color=ACCENT, alpha=0.85)  # Error histogram.
+    ax.set_xlabel("Float - dequantized value")
+    ax.set_ylabel("Count")
+    ax.set_title("8-bit quantization error is small and zero-centered")
+    ax.axvline(0, color="gray", linestyle="--", alpha=0.7)
+    savefig(fig, "quant_error_hist.png")
+
+def fig9_tree_structure(dt):
+    """FIG 9: compact render of the deployed decision tree (top levels)."""
+    fig, ax = plt.subplots(figsize=(11, 6))          # Wide canvas for the tree.
+    plot_tree(dt, max_depth=3,                       # Show only the top 3 levels.
+              feature_names=[f"f{i}" for i in range(N_KEEP)],
+              class_names=CLASS_NAMES, filled=True, rounded=True,
+              fontsize=7, ax=ax)
+    ax.set_title("Deployed decision tree (top levels; full depth = %d)" % DEPTH_DEPLOYED)
+    savefig(fig, "tree_structure.png")
+
+# =============================================================================
+# 3) MAIN
+# =============================================================================
+
+def main():
+    download_gsad_if_missing()                       # Ensure data present.
+
+    # ---- Canonical split + deployed model (shared by most figures) ----
+    Xtr_full, ytr = load_batches(TRAIN_BATCHES)      # Early-batch train.
+    Xte_full, yte = load_batches(TEST_BATCHES)       # Late-batch test.
+    cols = select_features(Xtr_full, ytr, N_KEEP)    # Feature selection on train.
+    qmin, span = fit_bounds(Xtr_full[:, cols])       # Train-only quant bounds.
+    Xtr_q = quantize(Xtr_full[:, cols], qmin, span)  # Quantized train.
+    Xte_q = quantize(Xte_full[:, cols], qmin, span)  # Quantized test.
+    dt = DecisionTreeClassifier(**DT_PARAMS).fit(Xtr_q, ytr)  # Deployed tree.
+
+    # ---- Protocol-A model for the drift figures (train on batch 1 only) ----
+    XtrA, ytrA = load_batches([1])                   # Batch-1 train.
+    colsA = select_features(XtrA, ytrA, N_KEEP)      # Reselect on batch 1.
+    qminA, spanA = fit_bounds(XtrA[:, colsA])        # Batch-1 bounds.
+    dtA = DecisionTreeClassifier(**DT_PARAMS).fit(quantize(XtrA[:, colsA], qminA, spanA), ytrA)
+
+    # ---- Build every figure ----
+    fig1_drift_curve(dtA, colsA, qminA, spanA)       # Drift trend.
+    fig2_drift_heatmap(dtA, colsA, qminA, spanA)     # Per-class drift.
+    fig3_depth_ablation(Xtr_q, ytr, Xte_q, yte)      # Depth ablation.
+    fig4_float_vs_int8(Xtr_full, ytr, Xte_full, yte, cols, qmin, span)  # Quant ablation.
+    fig5_confusion_matrix(dt, Xte_q, yte)            # Confusion matrix.
+    fig6_gamma_sweep(dt, Xte_q, yte)                 # Gamma sweep.
+    fig7_corr_heatmap(Xtr_full, cols)                # Correlation heatmap.
+    fig8_quant_error_hist(Xtr_full, cols, qmin, span)  # Quant-error histogram.
+    fig9_tree_structure(dt)                          # Tree structure.
+
+    print("\nAll figures written to:", OUTDIR.resolve())
+    print("NOTE: gamma-sweep uses hazardous={2,3,4,5} as a placeholder AQI set;")
+    print("      edit it in fig6_gamma_sweep to match your real hazardous-gas mapping.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+generate_all_tables.py
+======================
+Self-contained generator for every fillable table and figure-dataset in the
+TinyML / 8051 gas-classification paper.
+
+IMPORTANT - what this does and does NOT produce:
+  * It implements the pipeline the PAPER describes: 6 gas classes, GSAD
+    batches 1..10, correlation-driven selection down to N_KEEP features,
+    train-only 8-bit quantization, a depth-limited DecisionTree.
+  * It prints every table whose numbers come from DESKTOP/Python:
+      - Dataset composition          (Methodology)
+      - Preprocessing audit          (Methodology)
+      - Feature selection result     (Methodology)
+      - Quantization parameters      (Methodology)  <- desktop<->chip bridge
+      - Training configuration       (Model)
+      - Tree complexity              (Model)
+      - Table I  model comparison    (Results)
+      - Per-class precision/recall/F1(Results)
+      - Confusion matrix as a table  (Results)
+      - Quantization ablation        (Results)  float vs int8
+      - Depth ablation               (Results)  accuracy vs depth
+      - Confidence-threshold sweep   (Results)  AQI filtering
+      - Drift Protocol A / B         (Results)  per-batch + per-class
+      - Figure datasets              (drift curve, depth curve, etc.)
+  * It does NOT and CANNOT produce the ON-CHIP tables (measured accuracy
+    79%, latency 12.44 ms, code size, flash, RAM, energy). Those come from
+    flashing the EFM8BB1 and reading the UART dump. They are clearly marked
+    "[BOARD]" wherever they appear so you don't accidentally fill them with
+    desktop numbers.
+
+NOTE: A DecisionTree has NO training epochs. fit() builds the whole tree in
+one call, so there is no per-epoch output. Where the paper needs a sweep,
+the varying axis is a hyperparameter (tree depth) or a batch index (drift),
+not an epoch.
+
+Run:  python generate_all_tables.py
+Deps: numpy, scikit-learn, requests   (all preinstalled on Colab)
+"""
+
+import os                                         # Filesystem helpers.
+import re                                         # Regex for parsing the GSAD index:value format.
+import zipfile                                    # Extract the downloaded dataset archive.
+from io import BytesIO                            # Treat downloaded bytes as a file for zipfile.
+from pathlib import Path                          # Clean path handling.
+
+import numpy as np                                # Core numerics.
+import requests                                   # Auto-download the dataset.
+
+from sklearn.tree import DecisionTreeClassifier   # The deployed model type.
+from sklearn.ensemble import RandomForestClassifier   # Baseline for Table I.
+from sklearn.svm import SVC                        # Baseline for Table I.
+from sklearn.neural_network import MLPClassifier   # "TinyML NN" baseline for Table I.
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                             f1_score, confusion_matrix)   # All scoring funcs.
+
+# =============================================================================
+# 0) CONFIGURATION - single source of truth so every table uses the SAME model
+# =============================================================================
+
+SEED = 42                                          # Global RNG seed for reproducibility.
+N_KEEP = 8                                          # Features kept after selection (paper says 8).
+N_CLASSES = 6                                       # Six gas classes in GSAD.
+DEPTH_DEPLOYED = 10                                 # Deployed tree depth (paper Table VI).
+
+# The six GSAD gas classes, indexed 1..6 in the raw label field.
+CLASS_NAMES = ["Ethanol", "Ethylene", "Ammonia",
+               "Acetaldehyde", "Acetone", "Toluene"]
+
+# Hyperparameters for the DEPLOYED decision tree (kept in one dict so the
+# comparison, ablation, and drift sections all train an identical model).
+DT_PARAMS = dict(max_depth=DEPTH_DEPLOYED,          # Depth cap for MCU compactness.
+                 min_samples_leaf=10,               # Avoid tiny overfit leaves.
+                 random_state=SEED)                 # Reproducible splits/tree.
+
+DATASET_ROOT = "gsad"                               # Directory the .dat files live in.
+
+# =============================================================================
+# 1) DATA LOADING  (GSAD batch1..10, 128 features, 6-class label)
+# =============================================================================
+
+# Matches one "index:value" token, e.g. "3:-12.5" or "47:0.0031".
+_IDXVAL_RE = re.compile(r'(\d+):([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)')
+
+def download_gsad_if_missing(root=DATASET_ROOT):
+    """Download + extract the UCI GSAD dataset (id 224) if batch files are absent."""
+    rootp = Path(root)                              # Path object for the target dir.
+    rootp.mkdir(exist_ok=True)                      # Make sure the dir exists.
+    # If any batch*.dat already exists (here or in a Dataset/ subdir), skip.
+    if list(rootp.glob("batch*.dat")) or list(rootp.glob("**/batch*.dat")):
+        print("[data] GSAD batch files already present - skipping download")
+        return
+    url = "https://archive.ics.uci.edu/static/public/224/gas+sensor+array+drift+dataset.zip"
+    print("[data] downloading GSAD (~9.5 MB) ...")
+    r = requests.get(url, timeout=60)               # Fetch the archive.
+    r.raise_for_status()                            # Fail loudly on HTTP error.
+    with zipfile.ZipFile(BytesIO(r.content)) as z:  # Open the zip in memory.
+        z.extractall(rootp)                         # Extract into the target dir.
+    print("[data] extracted to", rootp.resolve())
+
+def _parse_dat(path):
+    """Parse one GSAD .dat file into (X[128], y) numpy arrays.
+
+    Each line format: <label>;<conc> 1:<v> 2:<v> ... 128:<v>
+    The leading integer before ';' is the gas class (1..6).
+    """
+    X_rows, y_rows = [], []                         # Accumulators for features and labels.
+    with open(path, "r", encoding="latin1") as f:   # latin1 tolerates raw bytes.
+        for line in f:                              # One sample per line.
+            line = line.strip()                     # Trim whitespace/newline.
+            if not line or ":" not in line:         # Skip blanks / malformed lines.
+                continue
+            # The class label is the first integer on the line (before ';' or space).
+            head = re.split(r'[;\s]', line, maxsplit=1)[0]
+            try:
+                label = int(float(head))            # Parse the gas-class id.
+            except ValueError:
+                continue                            # Skip lines with no valid label.
+            if not (1 <= label <= N_CLASSES):       # Guard against unexpected labels.
+                continue
+            pairs = _IDXVAL_RE.findall(line)        # All index:value sensor tokens.
+            vec = np.full(128, np.nan)              # Dense 128-channel row, default NaN.
+            for idx_str, val_str in pairs:          # Fill present channels.
+                idx = int(idx_str)
+                if 1 <= idx <= 128:                 # GSAD indices are 1-based.
+                    vec[idx - 1] = float(val_str)   # Store at 0-based position.
+            X_rows.append(vec)                      # Keep the feature row.
+            y_rows.append(label - 1)                # Store label as 0-based (0..5).
+    return np.asarray(X_rows), np.asarray(y_rows)   # Return as numpy arrays.
+
+def load_batches(batch_ids):
+    """Load and vertically stack the given batch numbers into (X, y)."""
+    rootp = Path(DATASET_ROOT)                      # Dataset directory.
+    Xs, ys = [], []                                 # Per-batch arrays.
+    for b in batch_ids:                             # For each requested batch id...
+        # The file may sit flat or under a Dataset/ subdir; try both.
+        cands = [rootp / f"batch{b}.dat",
+                 rootp / "Dataset" / f"batch{b}.dat"]
+        path = next((p for p in cands if p.exists()), None)
+        if path is None:                            # Missing batch -> warn and skip.
+            print(f"[data] WARNING: batch{b}.dat not found")
+            continue
+        Xb, yb = _parse_dat(path)                   # Parse that batch.
+        Xs.append(Xb); ys.append(yb)                # Collect it.
+    X = np.vstack(Xs)                               # Stack all feature rows.
+    y = np.concatenate(ys)                          # Concatenate all labels.
+    # Replace any residual NaNs with per-column means (simple, leakage-light here).
+    col_mean = np.nanmean(X, axis=0)                # Column means ignoring NaN.
+    inds = np.where(np.isnan(X))                    # Locations of remaining NaNs.
+    X[inds] = np.take(col_mean, inds[1])            # Fill them with the column mean.
+    return X, y                                     # Return the stacked dataset.
+
+# =============================================================================
+# 2) FEATURE SELECTION  (correlation + variance, deterministic)
+# =============================================================================
+
+def select_features(X, y, n_keep=N_KEEP, corr_threshold=0.95):
+    """Pick n_keep low-redundancy, high-variance sensor columns.
+
+    Returns the list of selected column indices (into the 128 channels).
+    """
+    corr = np.corrcoef(X.T)                         # 128x128 correlation matrix.
+    variances = np.var(X, axis=0)                   # Per-channel variance.
+    var_median = np.median(variances)               # Low-information cutoff.
+    selected, remaining = [], list(range(X.shape[1]))  # Chosen / candidate pools.
+    while len(selected) < n_keep and remaining:     # Greedy selection loop.
+        best, best_score = None, -np.inf            # Best candidate this round.
+        for idx in remaining:                       # Score every remaining channel.
+            if variances[idx] <= var_median:        # Skip uninformative channels.
+                continue
+            if selected:                            # If we already picked some...
+                max_corr = np.max(np.abs(corr[idx, selected]))  # Redundancy measure.
+                if max_corr >= corr_threshold:      # Too correlated -> skip.
+                    continue
+                score = variances[idx] - 10.0 * max_corr  # Reward var, penalize corr.
+            else:
+                score = variances[idx]              # First pick: pure variance.
+            if score > best_score:                  # Track the winner.
+                best_score, best = score, idx
+        if best is None:                            # No valid candidate -> stop.
+            break
+        selected.append(best); remaining.remove(best)  # Commit the pick.
+    return selected                                 # Return selected column indices.
+
+# =============================================================================
+# 3) QUANTIZATION  (train-only 8-bit, matches the firmware equation)
+# =============================================================================
+
+def fit_bounds(Xtr):
+    """Compute per-feature Qmin and span = Qmax-Qmin from TRAIN data only."""
+    qmin = Xtr.min(axis=0)                          # Per-feature minimum (Qmin).
+    qmax = Xtr.max(axis=0)                          # Per-feature maximum (Qmax).
+    span = np.where(qmax > qmin, qmax - qmin, 1.0)  # Avoid divide-by-zero spans.
+    return qmin, span                               # Return scaling parameters.
+
+def quantize(X, qmin, span):
+    """Map features to uint8 0..255 using the paper's quantization equation."""
+    xq = np.round(255.0 * (X - qmin) / span)        # Linear scale then round.
+    return np.clip(xq, 0, 255).astype(np.int32)     # Clamp to the 8-bit range.
+
+# =============================================================================
+# 4) SMALL HELPERS for metrics + pretty table printing
+# =============================================================================
+
+def prf(y_true, y_pred):
+    """Return (accuracy, macro-precision, macro-recall, macro-F1) as percentages."""
+    a = accuracy_score(y_true, y_pred) * 100        # Overall accuracy.
+    p = precision_score(y_true, y_pred, average="macro", zero_division=0) * 100  # Macro precision.
+    r = recall_score(y_true, y_pred, average="macro", zero_division=0) * 100     # Macro recall.
+    f = f1_score(y_true, y_pred, average="macro", zero_division=0) * 100         # Macro F1.
+    return a, p, r, f                               # Tuple of four percentages.
+
+def banner(title):
+    """Print a clearly delimited section header for easy copy/paste."""
+    print("\n" + "=" * 70)                          # Top rule.
+    print(title)                                    # Section title.
+    print("=" * 70)                                 # Bottom rule.
+
+# =============================================================================
+# 5) BUILD ONE CANONICAL TRAIN/TEST SPLIT used by the headline tables
+# =============================================================================
+# Strategy mirrors the paper's drift design: train on the EARLY batches,
+# test on the LATE batches. This keeps every "headline" table consistent.
+
+TRAIN_BATCHES = [1, 2, 3, 4, 5]                     # Early (lower-drift) batches.
+TEST_BATCHES  = [6, 7, 8, 9, 10]                    # Late (higher-drift) batches.
+
+# =============================================================================
+# 6) MAIN - generate every table in order
+# =============================================================================
+
+def main():
+    download_gsad_if_missing()                      # Ensure data is on disk.
+
+    # ---- Load the canonical split ----
+    Xtr_full, ytr = load_batches(TRAIN_BATCHES)     # Early-batch training data.
+    Xte_full, yte = load_batches(TEST_BATCHES)      # Late-batch test data.
+
+    # ---------------------------------------------------------------------
+    # TABLE: Dataset composition  (samples per batch x per class)
+    # ---------------------------------------------------------------------
+    banner("TABLE  Dataset composition (samples per batch and per class)")
+    print(f"{'Batch':>6} | " + " ".join(f"{n[:5]:>6}" for n in CLASS_NAMES) + " |  Total")
+    print("-" * 70)
+    total_per_class = np.zeros(N_CLASSES, dtype=int)  # Running totals per class.
+    grand_total = 0                                   # Running grand total.
+    for b in range(1, 11):                            # Each batch 1..10.
+        Xb, yb = load_batches([b])                    # Load one batch.
+        counts = [int(np.sum(yb == c)) for c in range(N_CLASSES)]  # Per-class counts.
+        total_per_class += np.array(counts)           # Accumulate per-class.
+        grand_total += len(yb)                        # Accumulate grand total.
+        print(f"{b:>6} | " + " ".join(f"{c:>6}" for c in counts) + f" | {len(yb):>6}")
+    print("-" * 70)
+    print(f"{'TOTAL':>6} | " + " ".join(f"{c:>6}" for c in total_per_class) + f" | {grand_total:>6}")
+
+    # ---------------------------------------------------------------------
+    # TABLE: Feature selection result  (which sensors + variance + max-corr)
+    # ---------------------------------------------------------------------
+    banner("TABLE  Feature selection (selected sensors, variance, max corr)")
+    cols = select_features(Xtr_full, ytr, N_KEEP)     # Run selection on TRAIN.
+    corr = np.corrcoef(Xtr_full.T)                     # Correlation matrix for reporting.
+    variances = np.var(Xtr_full, axis=0)              # Variances for reporting.
+    print(f"{'Rank':>4} | {'Sensor':>8} | {'Variance':>14} | {'MaxCorrToOthers':>16}")
+    print("-" * 60)
+    for rank, ci in enumerate(cols, 1):               # Each selected sensor.
+        others = [c for c in cols if c != ci]         # The other selected sensors.
+        mc = np.max(np.abs(corr[ci, others])) if others else 0.0  # Max correlation.
+        print(f"{rank:>4} | R{ci:<7} | {variances[ci]:>14.4f} | {mc:>16.3f}")
+    print(f"\nSelected {len(cols)} of 128 sensors (target N_KEEP={N_KEEP}).")
+
+    # ---------------------------------------------------------------------
+    # TABLE: Quantization parameters  (Qmin / Qmax / span per feature)
+    # ---------------------------------------------------------------------
+    banner("TABLE  Quantization parameters (per selected feature, TRAIN-only)")
+    qmin, span = fit_bounds(Xtr_full[:, cols])        # Bounds from TRAIN only.
+    qmax = qmin + span                                # Reconstruct Qmax for display.
+    print(f"{'Feature':>8} | {'Qmin':>14} | {'Qmax':>14} | {'Span':>14}")
+    print("-" * 60)
+    for j, ci in enumerate(cols):                     # One row per selected feature.
+        print(f"R{ci:<7} | {qmin[j]:>14.4f} | {qmax[j]:>14.4f} | {span[j]:>14.4f}")
+    print("\nThese exact bounds are what must be embedded in the firmware.")
+
+    # Pre-compute the quantized canonical split (used by several tables below).
+    Xtr_q = quantize(Xtr_full[:, cols], qmin, span)   # Quantized train features.
+    Xte_q = quantize(Xte_full[:, cols], qmin, span)   # Quantized test features.
+
+    # ---------------------------------------------------------------------
+    # TABLE: Training configuration + tree complexity
+    # ---------------------------------------------------------------------
+    banner("TABLE  Training configuration and tree complexity")
+    dt = DecisionTreeClassifier(**DT_PARAMS).fit(Xtr_q, ytr)  # Train deployed tree.
+    print(f"{'Setting':>22} | {'Value'}")
+    print("-" * 50)
+    print(f"{'max_depth':>22} | {DT_PARAMS['max_depth']}")
+    print(f"{'min_samples_leaf':>22} | {DT_PARAMS['min_samples_leaf']}")
+    print(f"{'random_state (seed)':>22} | {SEED}")
+    print(f"{'features kept':>22} | {N_KEEP}")
+    print(f"{'classes':>22} | {N_CLASSES}")
+    print(f"{'train batches':>22} | {TRAIN_BATCHES}")
+    print(f"{'test batches':>22} | {TEST_BATCHES}")
+    print(f"{'tree node count':>22} | {dt.tree_.node_count}")
+    print(f"{'tree leaf count':>22} | {dt.get_n_leaves()}")
+    print(f"{'tree achieved depth':>22} | {dt.tree_.max_depth}")
+
+    # ---------------------------------------------------------------------
+    # TABLE I: Desktop model comparison  (DT / RF / SVM / NN)
+    # ---------------------------------------------------------------------
+    banner("TABLE I  Desktop model comparison on GSAD (acc / prec / rec / F1)")
+    models = {                                         # Build each baseline.
+        "Decision Tree (Proposed)": DecisionTreeClassifier(**DT_PARAMS),
+        "Random Forest": RandomForestClassifier(n_estimators=100, random_state=SEED),
+        "SVM": SVC(kernel="rbf", random_state=SEED),
+        "TinyML NN": MLPClassifier(hidden_layer_sizes=(32, 16),
+                                   max_iter=300, random_state=SEED),
+    }
+    print(f"{'Model':<26} | {'Acc':>6} {'Prec':>6} {'Rec':>6} {'F1':>6}")
+    print("-" * 60)
+    for name, mdl in models.items():                   # Train + score each model.
+        mdl.fit(Xtr_q, ytr)                            # Same quantized features for all.
+        a, p, r, f = prf(yte, mdl.predict(Xte_q))      # Compute the four metrics.
+        print(f"{name:<26} | {a:6.1f} {p:6.1f} {r:6.1f} {f:6.1f}")
+
+    # ---------------------------------------------------------------------
+    # TABLE: Per-class precision / recall / F1 for the deployed tree
+    # ---------------------------------------------------------------------
+    banner("TABLE  Per-class precision / recall / F1 (deployed tree, test set)")
+    pred = dt.predict(Xte_q)                           # Predictions on test.
+    p_c = precision_score(yte, pred, average=None, labels=range(N_CLASSES), zero_division=0) * 100
+    r_c = recall_score(yte, pred, average=None, labels=range(N_CLASSES), zero_division=0) * 100
+    f_c = f1_score(yte, pred, average=None, labels=range(N_CLASSES), zero_division=0) * 100
+    print(f"{'Class':>14} | {'Prec':>7} {'Rec':>7} {'F1':>7}")
+    print("-" * 45)
+    for c in range(N_CLASSES):                          # One row per gas class.
+        print(f"{CLASS_NAMES[c]:>14} | {p_c[c]:7.1f} {r_c[c]:7.1f} {f_c[c]:7.1f}")
+
+    # ---------------------------------------------------------------------
+    # TABLE: Confusion matrix (counts), deployed tree on test set
+    # ---------------------------------------------------------------------
+    banner("TABLE  Confusion matrix (rows=true, cols=pred), deployed tree")
+    cm = confusion_matrix(yte, pred, labels=range(N_CLASSES))  # 6x6 counts.
+    print(" " * 14 + " ".join(f"{n[:5]:>6}" for n in CLASS_NAMES))  # Column header.
+    for c in range(N_CLASSES):                          # One row per true class.
+        print(f"{CLASS_NAMES[c]:>13} " + " ".join(f"{cm[c, k]:>6}" for k in range(N_CLASSES)))
+
+    # ---------------------------------------------------------------------
+    # TABLE VI (quant row): Quantization ablation  float vs int8
+    # ---------------------------------------------------------------------
+    banner("TABLE VI(a)  Quantization ablation: float vs int8 (same split)")
+    dt_float = DecisionTreeClassifier(**DT_PARAMS).fit(Xtr_full[:, cols], ytr)  # Float-feature tree.
+    af, pf, rf_, ff = prf(yte, dt_float.predict(Xte_full[:, cols]))  # Float metrics.
+    aq, pq, rq, fq = prf(yte, dt.predict(Xte_q))                     # Int8 metrics.
+    print(f"{'Configuration':<28} | {'Acc':>6} {'Prec':>6} {'Rec':>6} {'F1':>6}")
+    print("-" * 62)
+    print(f"{'Float features (no quant)':<28} | {af:6.1f} {pf:6.1f} {rf_:6.1f} {ff:6.1f}")
+    print(f"{'8-bit quantized (deployed)':<28} | {aq:6.1f} {pq:6.1f} {rq:6.1f} {fq:6.1f}")
+    print(f"\nQuantization cost: {af - aq:+.1f} accuracy points.")
+
+    # ---------------------------------------------------------------------
+    # TABLE VI (depth row) + FIGURE data: Depth ablation
+    # ---------------------------------------------------------------------
+    banner("TABLE VI(b) / FIGURE  Accuracy vs tree depth (int8 features)")
+    print(f"{'Depth':>6} | {'Acc':>6} {'Prec':>6} {'Rec':>6} {'F1':>6} | {'Nodes':>6}")
+    print("-" * 56)
+    for d in range(3, 13):                              # Sweep depth 3..12.
+        params = dict(DT_PARAMS); params["max_depth"] = d  # Override depth only.
+        m = DecisionTreeClassifier(**params).fit(Xtr_q, ytr)  # Train at this depth.
+        a, p, r, f = prf(yte, m.predict(Xte_q))        # Score it.
+        mark = "  <- deployed" if d == DEPTH_DEPLOYED else ""  # Flag deployed depth.
+        print(f"{d:>6} | {a:6.1f} {p:6.1f} {r:6.1f} {f:6.1f} | {m.tree_.node_count:>6}{mark}")
+
+    # ---------------------------------------------------------------------
+    # TABLE: Confidence-threshold (gamma) sweep for AQI filtering
+    # ---------------------------------------------------------------------
+    banner("TABLE  Confidence-threshold (gamma) sweep: AQI filtering effect")
+    # Confidence = max class probability at the predicted leaf, scaled to 0..255.
+    proba = dt.predict_proba(Xte_q)                     # Leaf class probabilities.
+    conf = (proba.max(axis=1) * 255).astype(int)        # 8-bit confidence per sample.
+    # Treat classes other than Ethanol(0)/Ethylene(1) as "Poor-air" events for AQI demo.
+    # (Replace this H-set with the paper's actual hazardous-class set if different.)
+    hazardous = {2, 3, 4, 5}                            # Set H of "Poor"-triggering classes.
+    true_poor = np.isin(yte, list(hazardous))           # Ground-truth POOR mask.
+    print(f"{'gamma':>6} | {'kept%':>6} {'POOR-acc':>9} {'false-alarm%':>12}")
+    print("-" * 50)
+    for g in (0, 200, 230, 250):                         # Confidence thresholds to test.
+        keep = conf >= g                                # Samples passing the filter.
+        kept_pct = 100.0 * keep.mean()                  # Fraction of decisions kept.
+        pred_poor = np.isin(pred, list(hazardous)) & keep  # Predicted-POOR & confident.
+        # POOR accuracy among confident predictions; false alarm = predicted POOR but truly GOOD.
+        if keep.sum() > 0:
+            poor_acc = 100.0 * np.mean(pred_poor[keep] == true_poor[keep])
+            false_alarm = 100.0 * np.mean(pred_poor[keep] & (~true_poor[keep]))
+        else:
+            poor_acc = false_alarm = float("nan")
+        print(f"{g:>6} | {kept_pct:6.1f} {poor_acc:9.1f} {false_alarm:12.1f}")
+    print("\ngamma=0 is the no-filter baseline; higher gamma suppresses low-confidence calls.")
+
+    # ---------------------------------------------------------------------
+    # TABLE + FIGURE data: Drift Protocol A (train batch1, test each later)
+    # ---------------------------------------------------------------------
+    banner("TABLE / FIGURE  Drift Protocol A: train=batch1, test=batch 2..10")
+    XtrA, ytrA = load_batches([1])                       # Train on the first batch only.
+    colsA = select_features(XtrA, ytrA, N_KEEP)         # Reselect features on batch 1.
+    qminA, spanA = fit_bounds(XtrA[:, colsA])           # Bounds from batch 1.
+    dtA = DecisionTreeClassifier(**DT_PARAMS).fit(quantize(XtrA[:, colsA], qminA, spanA), ytrA)
+    hdr = f"{'Batch':>6} | {'Acc':>6} {'MacroF1':>8} | " + " ".join(f"{n[:4]:>5}" for n in CLASS_NAMES)
+    print(hdr); print("-" * len(hdr))
+    for b in range(2, 11):                               # Test on each later batch.
+        Xb, yb = load_batches([b])                       # Load the test batch.
+        pb = dtA.predict(quantize(Xb[:, colsA], qminA, spanA))  # Predict.
+        a = accuracy_score(yb, pb) * 100                 # Overall accuracy.
+        mf = f1_score(yb, pb, average="macro", zero_division=0)  # Macro F1.
+        cmb = confusion_matrix(yb, pb, labels=range(N_CLASSES))  # For per-class acc.
+        pcs = []                                         # Per-class accuracy strings.
+        for c in range(N_CLASSES):
+            tot = cmb[c].sum()                           # Samples of class c in this batch.
+            pcs.append(f"{(100*cmb[c,c]/tot):5.0f}" if tot else "  nan")
+        print(f"{b:>6} | {a:6.1f} {mf:8.3f} | " + " ".join(pcs))
+    print("\nFalling accuracy across batches quantifies drift; the per-class")
+    print("columns show WHICH gases drift first - that is the actual finding.")
+
+    # ---------------------------------------------------------------------
+    # TABLE: Drift Protocol B (train 1-5, test 6-10) - the headline
+    # ---------------------------------------------------------------------
+    banner("TABLE  Drift Protocol B: train=1-5, test=6-10 (headline)")
+    a, p, r, f = prf(yte, dt.predict(Xte_q))            # Reuse the canonical model.
+    print(f"Late-batch accuracy : {a:.1f}%   macro-F1 : {f/100:.3f}")
+    cmB = confusion_matrix(yte, dt.predict(Xte_q), labels=range(N_CLASSES))
+    print("Per-class accuracy:")
+    for c in range(N_CLASSES):                            # Per-class accuracy line.
+        tot = cmB[c].sum()
+        val = (100 * cmB[c, c] / tot) if tot else float("nan")
+        print(f"   {CLASS_NAMES[c]:>14}: {val:5.1f}%")
+
+    # ---------------------------------------------------------------------
+    # BOARD-ONLY tables: print a stub so you don't forget they exist.
+    # ---------------------------------------------------------------------
+    banner("BOARD-ONLY tables  (cannot be generated here - flash + UART dump)")
+    print("These rows come from the EFM8BB1, NOT from this script:")
+    print("  [BOARD] On-chip accuracy ......... measured over N=100 samples")
+    print("  [BOARD] Inference latency ........ Timer0 microsecond count")
+    print("  [BOARD] Throughput ............... 1000 / latency_ms")
+    print("  [BOARD] Executable code size ..... linker size report")
+    print("  [BOARD] Constant flash ........... linker size report")
+    print("  [BOARD] Internal / external RAM .. linker memory map")
+    print("  [BOARD] Avg power / energy ....... datasheet currents + duty cycle")
+    print("\nLeave these as measured values from your last board run.")
+
+    print("\n" + "=" * 70)
+    print("DONE. Every desktop/ablation/drift table above is ready to copy in.")
+    print("Board tables stay marked [BOARD] - fill them from your UART dump.")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()                                              # Run the full table generation.    
